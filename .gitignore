@@ -1,0 +1,30 @@
+# --- secrets: never commit ---
+.env
+.env.*
+!.env.example
+
+# --- uploaded statements and invoices (financial data) ---
+uploads/
+.test_uploads/
+*.pdf
+
+# --- python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- logs, editors, OS ---
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- archives ---
+*.tgz
+*.zip
