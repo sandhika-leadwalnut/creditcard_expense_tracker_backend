@@ -2,17 +2,17 @@ import csv
 import io
 import os
 import re
-import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..config import get_settings
 from ..db import get_db
 from ..security import can_edit, current_user
 from ..services.rules import apply_rules, load_lookups
+from ..services.storage import delete_file, file_response, save_file
 from ..utils import audit, clean, oid
 
 router = APIRouter(tags=["transactions"])
@@ -223,6 +223,7 @@ def list_attachments(txn_id: str, _=Depends(current_user)):
     rows = list(get_db().attachments.find({"transaction_id": oid(txn_id)}).sort("uploaded_at", -1))
     for r in rows:
         r.pop("stored_path", None)
+        r.pop("file_id", None)
     return clean(rows)
 
 
@@ -246,14 +247,10 @@ async def add_attachment(
     if len(data) > s.max_upload_mb * 1024 * 1024:
         raise HTTPException(400, f"File is larger than {s.max_upload_mb} MB")
 
-    company = txn.get("company") or "UNASSIGNED"
-    folder = os.path.join(s.upload_dir, "invoices", company, txn["month"])
-    os.makedirs(folder, exist_ok=True)
-    stored = os.path.join(folder, f"{uuid.uuid4().hex}{ext}")
-    with open(stored, "wb") as f:
-        f.write(data)
+    file_id = save_file(data, name, file.content_type, kind=doc_type, transaction_id=str(txn["_id"]),
+                        company=txn.get("company") or "UNASSIGNED", month=txn["month"])
     doc = {
-        "transaction_id": txn["_id"], "file_name": name, "stored_path": stored,
+        "transaction_id": txn["_id"], "file_name": name, "file_id": file_id,   # file stored in MongoDB
         "content_type": file.content_type, "size": len(data), "doc_type": doc_type,
         "uploaded_by": user["email"], "uploaded_at": datetime.utcnow(),
     }
@@ -264,16 +261,16 @@ async def add_attachment(
     apply_rules(txn, cats, secs)
     db.transactions.replace_one({"_id": txn["_id"]}, txn)
     audit(db, user, "transaction", txn["_id"], "attach", {"file": name, "doc_type": doc_type})
-    doc.pop("stored_path")
+    doc.pop("file_id")
     return {"attachment": clean(doc), "transaction": clean(txn)}
 
 
 @router.get("/attachments/{att_id}/download")
 def download_attachment(att_id: str, _=Depends(current_user)):
     a = get_db().attachments.find_one({"_id": oid(att_id)})
-    if not a or not os.path.exists(a["stored_path"]):
+    if not a:
         raise HTTPException(404, "File not found")
-    return FileResponse(a["stored_path"], filename=a["file_name"], media_type=a.get("content_type"))
+    return file_response(a.get("file_id"), a["file_name"], a.get("content_type"))
 
 
 @router.delete("/attachments/{att_id}")
@@ -285,8 +282,7 @@ def delete_attachment(att_id: str, user=Depends(can_edit)):
     txn = db.transactions.find_one({"_id": a["transaction_id"]})
     _ensure_editable(db, txn)
     db.attachments.delete_one({"_id": a["_id"]})
-    if os.path.exists(a["stored_path"]):
-        os.remove(a["stored_path"])
+    delete_file(a.get("file_id"))
     txn["attachment_count"] = db.attachments.count_documents({"transaction_id": txn["_id"]})
     cats, secs = load_lookups(db)
     apply_rules(txn, cats, secs)

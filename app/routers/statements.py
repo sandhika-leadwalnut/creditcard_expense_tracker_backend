@@ -1,9 +1,6 @@
-import os
-import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pymongo.errors import DuplicateKeyError
 
@@ -12,6 +9,7 @@ from ..db import get_db
 from ..parsers.registry import PasswordRequired, UnsupportedStatement, parse_pdf
 from ..security import can_edit, current_user, is_admin
 from ..services.rules import apply_rules, auto_tag, load_lookups
+from ..services.storage import delete_file, file_response, save_file, temp_copy
 from ..utils import audit, clean, oid
 
 router = APIRouter(prefix="/statements", tags=["statements"])
@@ -60,23 +58,18 @@ async def upload_statement(
     if len(data) > s.max_upload_mb * 1024 * 1024:
         raise HTTPException(400, f"File is larger than {s.max_upload_mb} MB")
 
-    folder = os.path.join(s.upload_dir, "statements")
-    os.makedirs(folder, exist_ok=True)
-    stored = os.path.join(folder, f"{uuid.uuid4().hex}.pdf")
-    with open(stored, "wb") as f:
-        f.write(data)
-
     try:
-        parsed = parse_pdf(stored, password)
+        with temp_copy(data) as tmp:          # read the PDF from a temp file, deleted right after
+            parsed = parse_pdf(tmp, password)
     except PasswordRequired as e:
-        os.remove(stored)
         raise HTTPException(422, {"code": "password_required", "message": str(e)})
     except UnsupportedStatement as e:
-        os.remove(stored)
         raise HTTPException(422, {"code": "unsupported", "message": str(e)})
     if not parsed.rows:
-        os.remove(stored)
         raise HTTPException(422, {"code": "no_rows", "message": "No transactions found in this PDF"})
+    if db.statements.find_one({"card_last4": parsed.card_last4, "statement_date": parsed.statement_date.isoformat()}):
+        raise HTTPException(409, {"code": "duplicate", "message": "This statement has already been uploaded"})
+    file_id = save_file(data, file.filename, "application/pdf", kind="statement", card_last4=parsed.card_last4)
 
     now = datetime.utcnow()
     st_doc = {
@@ -90,7 +83,7 @@ async def upload_statement(
         "purchases_total": parsed.purchases_total,
         "payments_total": parsed.payments_total,
         "file_name": file.filename,
-        "file_path": stored,
+        "file_id": file_id,                # PDF stored in MongoDB (GridFS)
         "status": "in_review",
         "uploaded_by": user["email"],
         "uploaded_at": now,
@@ -99,7 +92,7 @@ async def upload_statement(
     try:
         st_id = db.statements.insert_one(st_doc).inserted_id
     except DuplicateKeyError:
-        os.remove(stored)
+        delete_file(file_id)
         raise HTTPException(409, {"code": "duplicate", "message": "This statement has already been uploaded"})
 
     rules = list(db.vendor_rules.find())
@@ -151,15 +144,16 @@ def get_statement(statement_id: str, _=Depends(current_user)):
     st["reconciliation"] = reconciliation(db, st)
     st["checklist"] = checklist(db, st["_id"])
     st.pop("file_path", None)
+    st.pop("file_id", None)
     return clean(st)
 
 
 @router.get("/{statement_id}/file")
 def download_statement(statement_id: str, _=Depends(current_user)):
     st = get_db().statements.find_one({"_id": oid(statement_id)})
-    if not st or not os.path.exists(st["file_path"]):
-        raise HTTPException(404, "File not found")
-    return FileResponse(st["file_path"], filename=st["file_name"], media_type="application/pdf")
+    if not st:
+        raise HTTPException(404, "Statement not found")
+    return file_response(st.get("file_id"), st["file_name"], "application/pdf")
 
 
 class LockIn(BaseModel):
@@ -206,12 +200,10 @@ def delete_statement(statement_id: str, user=Depends(is_admin)):
         raise HTTPException(409, "Unlock the statement before deleting it")
     txn_ids = [t["_id"] for t in db.transactions.find({"statement_id": st["_id"]}, {"_id": 1})]
     for a in db.attachments.find({"transaction_id": {"$in": txn_ids}}):
-        if os.path.exists(a["stored_path"]):
-            os.remove(a["stored_path"])
+        delete_file(a.get("file_id"))
     db.attachments.delete_many({"transaction_id": {"$in": txn_ids}})
     db.transactions.delete_many({"statement_id": st["_id"]})
     db.statements.delete_one({"_id": st["_id"]})
-    if os.path.exists(st["file_path"]):
-        os.remove(st["file_path"])
+    delete_file(st.get("file_id"))
     audit(db, user, "statement", statement_id, "delete", {"file": st["file_name"]})
     return {"ok": True}

@@ -10,7 +10,6 @@ import pytest
 
 os.environ["MONGO_URI"] = "mongomock://localhost"
 os.environ["MONGO_DB"] = "test_db"
-os.environ["UPLOAD_DIR"] = "./.test_uploads"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -79,6 +78,12 @@ def test_upload_and_rules(client):
     r = client.post(f"/api/transactions/{t['id']}/attachments",
                     files={"file": ("inv.pdf", b"%PDF-1.4 test", "application/pdf")}, data={"doc_type": "invoice"})
     assert r.json()["transaction"]["invoice_status"] == "attached"
+    att = r.json()["attachment"]
+    d = client.get(f"/api/attachments/{att['id']}/download")
+    assert d.status_code == 200 and d.content == b"%PDF-1.4 test"      # file comes back from MongoDB
+    assert "inv.pdf" in d.headers["content-disposition"]
+    pdf = client.get(f"/api/statements/{st['id']}/file")
+    assert pdf.status_code == 200 and pdf.content[:4] == b"%PDF"
 
     # lock is blocked while items are open
     assert client.post(f"/api/statements/{st['id']}/lock", json={}).status_code == 409
