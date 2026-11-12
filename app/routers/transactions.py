@@ -139,6 +139,8 @@ def update_transaction(txn_id: str, body: TxnPatch, user=Depends(can_edit)):
         raise HTTPException(400, "Enter the TDS amount or choose a TDS section")
 
     before = {k: txn.get(k) for k in changes}
+    if "company" in changes:
+        changes["company_source"] = "manual"
     txn.update(changes)
     if "category" in changes and "is_subscription" not in changes:
         cat = db.categories.find_one({"name": changes["category"]})
@@ -200,6 +202,7 @@ def bulk_update(body: BulkPatch, user=Depends(can_edit)):
         txn.update(changes)
         if "company" in changes:
             txn["split"] = []
+            txn["company_source"] = "manual"
         if "category" in changes:
             cat = cats.get(changes["category"], {})
             txn["is_subscription"] = bool(cat.get("subscription"))

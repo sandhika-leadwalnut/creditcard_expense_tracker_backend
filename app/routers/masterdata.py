@@ -116,3 +116,40 @@ def delete_rule(rule_id: str, user=Depends(can_edit)):
     db.vendor_rules.delete_one({"_id": oid(rule_id)})
     audit(db, user, "vendor_rule", rule_id, "delete")
     return {"ok": True}
+
+
+# ---------------- cards: which company each card belongs to ----------------
+class CardIn(BaseModel):
+    card_last4: str
+    holder_name: str
+    company: str                      # default company for this card's transactions
+    bank: str | None = None
+    active: bool = True
+
+
+@router.get("/cards")
+def list_cards(_=Depends(current_user)):
+    return clean(list(get_db().cards.find().sort("holder_name")))
+
+
+@router.post("/cards")
+def upsert_card(body: CardIn, user=Depends(is_admin)):
+    db = get_db()
+    last4 = "".join(ch for ch in body.card_last4 if ch.isdigit())[-4:]
+    if len(last4) != 4:
+        raise HTTPException(400, "Enter the last 4 digits of the card")
+    if not db.companies.find_one({"code": body.company, "active": True}):
+        raise HTTPException(400, f"Unknown company {body.company}")
+    data = {**body.model_dump(), "card_last4": last4, "holder_name": body.holder_name.strip(),
+            "updated_by": user["email"], "updated_at": datetime.utcnow()}
+    db.cards.update_one({"card_last4": last4}, {"$set": data}, upsert=True)
+    audit(db, user, "card", last4, "upsert", body.model_dump())
+    return clean(db.cards.find_one({"card_last4": last4}))
+
+
+@router.delete("/cards/{card_id}")
+def delete_card(card_id: str, user=Depends(is_admin)):
+    db = get_db()
+    db.cards.delete_one({"_id": oid(card_id)})
+    audit(db, user, "card", card_id, "delete")
+    return {"ok": True}

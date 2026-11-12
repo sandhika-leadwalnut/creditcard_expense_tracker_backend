@@ -46,11 +46,17 @@ def test_meta(client):
 
 @pytest.mark.skipif(not SAMPLE, reason="SAMPLE_STATEMENT not set")
 def test_upload_and_rules(client):
+    # card 7170 belongs to LW: every row should get LW automatically
+    r = client.post("/api/cards", json={"card_last4": "7170", "holder_name": "Ajay Batra", "company": "LW"})
+    assert r.status_code == 200, r.text
+    assert client.post("/api/cards", json={"card_last4": "12", "holder_name": "X", "company": "LW"}).status_code == 400
     with open(SAMPLE, "rb") as f:
         r = client.post("/api/statements/upload", files={"file": ("st.pdf", f, "application/pdf")})
     assert r.status_code == 200, r.text
     st = r.json()
     assert st["reconciliation"]["ok"], st["reconciliation"]
+    assert st["card_holder"] == "Ajay Batra" and st["default_company"] == "LW"
+    assert st["checklist"]["unassigned_company"] == 0
 
     with open(SAMPLE, "rb") as f:  # duplicate upload is blocked
         assert client.post("/api/statements/upload", files={"file": ("st.pdf", f, "application/pdf")}).status_code == 409
@@ -65,6 +71,14 @@ def test_upload_and_rules(client):
     # >10k travel needs invoice, <=10k does not
     mmt = by_vendor["MakeMyTrip"]
     assert all(t["invoice_required"] == (t["amount"] > 10000) for t in mmt)
+
+    assert all(t["company"] == "LW" and t["company_source"] == "card" for t in rows)
+
+    # clearing a row, then "apply card default" fills only that row back in
+    z = rows[0]
+    assert client.patch(f"/api/transactions/{z['id']}", json={"company": ""}).json()["company"] is None
+    r = client.post(f"/api/statements/{st['id']}/apply-card-default").json()
+    assert r == {"updated": 1, "company": "LW"}
 
     # split + TDS + attachment flow
     t = by_vendor["Blueprints"][0]

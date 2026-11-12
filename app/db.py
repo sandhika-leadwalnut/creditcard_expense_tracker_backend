@@ -32,6 +32,7 @@ def ensure_indexes(db: Database) -> None:
     db.companies.create_index("code", unique=True)
     db.categories.create_index("name", unique=True)
     db.tds_sections.create_index("code", unique=True)
+    db.cards.create_index("card_last4", unique=True)
     db.vendor_rules.create_index([("priority", DESCENDING)])
     db.statements.create_index([("card_last4", ASCENDING), ("statement_date", ASCENDING)], unique=True)
     db.transactions.create_index([("statement_id", ASCENDING), ("seq", ASCENDING)])

@@ -35,6 +35,10 @@ class KotakCorporateParser(StatementParser):
 
     # ---- header fields ----
     def _header(self, text: str, st: ParsedStatement):
+        # the cardholder's name is the first line of the statement
+        first = next((l.strip() for l in text.splitlines() if l.strip()), "")
+        if first and not any(ch.isdigit() for ch in first) and len(first) <= 60:
+            st.card_holder = first.title()
         m = re.search(r"Statement Date\s+(\d{2}-[A-Za-z]{3}-\d{4})", text)
         if m:
             st.statement_date = _d(m.group(1))

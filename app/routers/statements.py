@@ -34,6 +34,14 @@ def checklist(db, st_id) -> dict:
     }
 
 
+def card_default(db, card_last4: str):
+    """The card's default company from Settings → Cards (None if the card isn't set up)."""
+    card = db.cards.find_one({"card_last4": card_last4, "active": True})
+    if card and db.companies.find_one({"code": card["company"], "active": True}):
+        return card
+    return None
+
+
 @router.get("")
 def list_statements(_=Depends(current_user)):
     db = get_db()
@@ -88,6 +96,7 @@ async def upload_statement(
         "uploaded_by": user["email"],
         "uploaded_at": now,
         "parse_warnings": parsed.warnings,
+        "card_holder": parsed.card_holder,
     }
     try:
         st_id = db.statements.insert_one(st_doc).inserted_id
@@ -97,6 +106,10 @@ async def upload_statement(
 
     rules = list(db.vendor_rules.find())
     cats, secs = load_lookups(db)
+    card = card_default(db, parsed.card_last4)
+    if card:
+        db.statements.update_one({"_id": st_id}, {"$set": {"default_company": card["company"],
+                                                         "card_holder": card["holder_name"] or parsed.card_holder}})
     docs = []
     for r in parsed.rows:
         signed = -r.amount if r.is_credit else r.amount
@@ -127,6 +140,11 @@ async def upload_statement(
             "updated_at": now,
         }
         auto_tag(t, rules)
+        if t.get("company"):
+            t["company_source"] = "vendor_rule"        # a vendor rule with a company wins
+        elif card and not t.get("excluded"):
+            t["company"] = card["company"]             # otherwise the card's default company
+            t["company_source"] = "card"
         apply_rules(t, cats, secs)
         docs.append(t)
     db.transactions.insert_many(docs)
@@ -154,6 +172,32 @@ def download_statement(statement_id: str, _=Depends(current_user)):
     if not st:
         raise HTTPException(404, "Statement not found")
     return file_response(st.get("file_id"), st["file_name"], "application/pdf")
+
+
+@router.post("/{statement_id}/apply-card-default")
+def apply_card_default(statement_id: str, user=Depends(can_edit)):
+    """Fill the card's company into rows that have no company yet (rows already set are left alone)."""
+    db = get_db()
+    st = db.statements.find_one({"_id": oid(statement_id)})
+    if not st:
+        raise HTTPException(404, "Statement not found")
+    if st["status"] == "locked":
+        raise HTTPException(409, "This month is locked. Unlock it first.")
+    card = card_default(db, st["card_last4"])
+    if not card:
+        raise HTTPException(400, f"Card XXXX{st['card_last4']} is not set up. Add it in Settings → Cards.")
+    cats, secs = load_lookups(db)
+    n = 0
+    for t in db.transactions.find({"statement_id": st["_id"], "excluded": {"$ne": True}, "company": None}):
+        t.update(company=card["company"], split=[], company_source="card",
+                 updated_at=datetime.utcnow(), updated_by=user["email"])
+        apply_rules(t, cats, secs)
+        db.transactions.replace_one({"_id": t["_id"]}, t)
+        n += 1
+    db.statements.update_one({"_id": st["_id"]}, {"$set": {"default_company": card["company"],
+                                                          "card_holder": card["holder_name"]}})
+    audit(db, user, "statement", st["_id"], "apply_card_default", {"company": card["company"], "rows": n})
+    return {"updated": n, "company": card["company"]}
 
 
 class LockIn(BaseModel):
